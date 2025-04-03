@@ -26,6 +26,7 @@ from .mixins.ti import TICompiler
 from .mixins.arm import ArmCompiler, ArmclangCompiler
 from .mixins.visualstudio import MSVCCompiler, ClangClCompiler
 from .mixins.gnu import GnuCompiler, gnu_common_warning_args, gnu_cpp_warning_args
+from .mixins.qnx import QnxCompiler
 from .mixins.intel import IntelGnuLikeCompiler, IntelVisualStudioLikeCompiler
 from .mixins.clang import ClangCompiler
 from .mixins.elbrus import ElbrusCompiler
@@ -158,7 +159,7 @@ class CPPCompiler(CLikeCompiler, Compiler):
         }
 
         # Currently, remapping is only supported for Clang, Elbrus and GCC
-        assert self.id in frozenset(['clang', 'lcc', 'gcc', 'emscripten', 'armltdclang', 'intel-llvm'])
+        assert self.id in frozenset(['clang', 'lcc', 'gcc', 'emscripten', 'armltdclang', 'intel-llvm', 'qcc'])
 
         if cpp_std not in CPP_FALLBACKS:
             # 'c++03' and 'c++98' don't have fallback types
@@ -439,6 +440,117 @@ class GnuCPPCompiler(_StdCPPLibMixin, GnuCompiler, CPPCompiler):
         CPPCompiler.__init__(self, ccache, exelist, version, for_machine, is_cross,
                              info, linker=linker, full_version=full_version)
         GnuCompiler.__init__(self, defines)
+        default_warn_args = ['-Wall', '-Winvalid-pch']
+        self.warn_args = {'0': [],
+                          '1': default_warn_args,
+                          '2': default_warn_args + ['-Wextra'],
+                          '3': default_warn_args + ['-Wextra', '-Wpedantic'],
+                          'everything': (default_warn_args + ['-Wextra', '-Wpedantic'] +
+                                         self.supported_warn_args(gnu_common_warning_args) +
+                                         self.supported_warn_args(gnu_cpp_warning_args))}
+
+    def get_options(self) -> 'MutableKeyedOptionDictType':
+        key = self.form_compileropt_key('std')
+        opts = CPPCompiler.get_options(self)
+        self.update_options(
+            opts,
+            self.create_option(options.UserComboOption,
+                               self.form_compileropt_key('eh'),
+                               'C++ exception handling type',
+                               ['none', 'default', 'a', 's', 'sc'],
+                               'default'),
+            self.create_option(options.UserBooleanOption,
+                               self.form_compileropt_key('rtti'),
+                               'Enable RTTI',
+                               True),
+            self.create_option(options.UserBooleanOption,
+                               self.form_compileropt_key('debugstl'),
+                               'STL debug mode',
+                               False),
+        )
+        cppstd_choices = [
+            'c++98', 'c++03', 'c++11', 'c++14', 'c++17', 'c++1z',
+            'c++2a', 'c++20',
+        ]
+        if version_compare(self.version, '>=11.0.0'):
+            cppstd_choices.append('c++23')
+        if version_compare(self.version, '>=14.0.0'):
+            cppstd_choices.append('c++26')
+        std_opt = opts[key]
+        assert isinstance(std_opt, options.UserStdOption), 'for mypy'
+        std_opt.set_versions(cppstd_choices, gnu=True)
+        if self.info.is_windows() or self.info.is_cygwin():
+            self.update_options(
+                opts,
+                self.create_option(options.UserArrayOption,
+                                   key.evolve('cpp_winlibs'),
+                                   'Standard Windows libs to link against',
+                                   gnu_winlibs),
+            )
+        return opts
+
+    def get_option_compile_args(self, options: 'KeyedOptionDictType') -> T.List[str]:
+        args: T.List[str] = []
+        stdkey = self.form_compileropt_key('std')
+        ehkey = self.form_compileropt_key('eh')
+        rttikey = self.form_compileropt_key('rtti')
+        debugstlkey = self.form_compileropt_key('debugstl')
+
+        std = options.get_value(stdkey)
+        if std != 'none':
+            args.append(self._find_best_cpp_std(std))
+
+        non_msvc_eh_options(options.get_value(ehkey), args)
+
+        if not options.get_value(rttikey):
+            args.append('-fno-rtti')
+
+        if options.get_value(debugstlkey):
+            args.append('-D_GLIBCXX_DEBUG=1')
+        return args
+
+    def get_option_link_args(self, options: 'KeyedOptionDictType') -> T.List[str]:
+        if self.info.is_windows() or self.info.is_cygwin():
+            # without a typedict mypy can't understand this.
+            key = self.form_compileropt_key('winlibs')
+            libs = options.get_value(key).copy()
+            assert isinstance(libs, list)
+            for l in libs:
+                assert isinstance(l, str)
+            return libs
+        return []
+
+    def get_assert_args(self, disable: bool, env: 'Environment') -> T.List[str]:
+        if disable:
+            return ['-DNDEBUG']
+
+        # Don't inject the macro if the compiler already has it pre-defined.
+        for macro in ['_GLIBCXX_ASSERTIONS', '_LIBCPP_HARDENING_MODE', '_LIBCPP_ENABLE_ASSERTIONS']:
+            if self.defines.get(macro) is not None:
+                return []
+
+        if self.language_stdlib_provider(env) == 'stdc++':
+            return ['-D_GLIBCXX_ASSERTIONS=1']
+        else:
+            if version_compare(self.version, '>=18'):
+                return ['-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_FAST']
+            elif version_compare(self.version, '>=15'):
+                return ['-D_LIBCPP_ENABLE_ASSERTIONS=1']
+
+        return []
+
+    def get_pch_use_args(self, pch_dir: str, header: str) -> T.List[str]:
+        return ['-fpch-preprocess', '-include', os.path.basename(header)]
+
+class QnxCPPCompiler(_StdCPPLibMixin, QnxCompiler, CPPCompiler):
+    def __init__(self, ccache: T.List[str], exelist: T.List[str], version: str, for_machine: MachineChoice, is_cross: bool,
+                 info: 'MachineInfo',
+                 linker: T.Optional['DynamicLinker'] = None,
+                 defines: T.Optional[T.Dict[str, str]] = None,
+                 full_version: T.Optional[str] = None):
+        CPPCompiler.__init__(self, ccache, exelist, version, for_machine, is_cross,
+                             info, linker=linker, full_version=full_version)
+        QnxCompiler.__init__(self, defines)
         default_warn_args = ['-Wall', '-Winvalid-pch']
         self.warn_args = {'0': [],
                           '1': default_warn_args,

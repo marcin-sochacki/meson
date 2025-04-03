@@ -343,6 +343,8 @@ def _detect_c_or_cpp_compiler(env: 'Environment', lang: str, for_machine: Machin
         if 'Microchip Technology' in out:
             # this output has "Free Software Foundation" in its version
             guess_gcc_or_lcc = None
+        if  compiler_name in {'qcc', 'q++'}:
+            guess_gcc_or_lcc = 'qcc'
 
         if guess_gcc_or_lcc:
             defines = _get_gnu_compiler_defines(compiler, lang)
@@ -353,6 +355,9 @@ def _detect_c_or_cpp_compiler(env: 'Environment', lang: str, for_machine: Machin
             if guess_gcc_or_lcc == 'lcc':
                 version = _get_lcc_version_from_defines(defines)
                 cls = c.ElbrusCCompiler if lang == 'c' else cpp.ElbrusCPPCompiler
+            elif guess_gcc_or_lcc == 'qcc':
+                version = _get_gnu_version_from_defines(defines)
+                cls = c.QnxCCompiler if lang == 'c' else cpp.QnxCPPCompiler
             else:
                 version = _get_gnu_version_from_defines(defines)
                 cls = c.GnuCCompiler if lang == 'c' else cpp.GnuCPPCompiler
