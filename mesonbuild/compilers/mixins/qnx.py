@@ -108,4 +108,4 @@ class QnxCompiler(GnuLikeCompiler):
         return super().get_profile_use_args() + ['-fprofile-correction']
 
     def get_dependency_gen_args(self, outtarget: str, outfile: str) -> T.List[str]:
-        return []
+        return ['-Wc,-MT,'+outtarget, '-Wc,-MMD', '-Wc,-MP', '-Wc,-MF,'+outfile]
